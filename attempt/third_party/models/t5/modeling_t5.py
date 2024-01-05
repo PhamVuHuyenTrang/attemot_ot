@@ -48,9 +48,8 @@ from .configuration_t5 import T5Config
 
 from adapters import AdapterController
 from typing import Dict, Any
-import numpy as np
-from ot.backend import get_backend, NumpyBackend
-from ot.utils import list_to_array, get_coordinate_circle
+
+import ot
 
 logger = logging.get_logger(__name__)
 
@@ -898,7 +897,7 @@ class T5PreTrainedModel(PreTrainedModel):
 
 
 class T5Stack(T5PreTrainedModel):
-    def __init__(self, config, embed_tokens=None, adapter_config=None, prefix_emb=None, attn_prefix_tuning=False, mul_prefix_emb=None, model_dim=768, attn_method="linear", shared_attn=False, ignore_target=False, temperature=2000, learned_temperature=False):
+    def __init__(self, config, embed_tokens=None, adapter_config=None, prefix_emb=None, attn_prefix_tuning=False, mul_prefix_emb=None, model_dim=768, attn_method="linear", shared_attn=False, ignore_target=False, temperature=2000, learned_temperature=True):
         super().__init__(config)
 
         self.embed_tokens = embed_tokens
@@ -913,13 +912,11 @@ class T5Stack(T5PreTrainedModel):
         self.attn_method = attn_method
         self.model_dim = model_dim
         self.shared_attn = shared_attn
-        self.learned_temperature = learned_temperature
+        self.learned_temperature = True #learned_temperature
         self.target_task_id = None
         if self.learned_temperature is True:
-            # The code causes error; need to fix a bug.
-            # RuntimeError: Trying to backward through the graph a second time (or directly access saved variables after they have already been freed). Saved intermediate values of the graph are freed when you call .backward() or autograd.grad(). Specify retain_graph=True if you need to backward through the graph a second time or if you need to access saved variables after calling backward
-            self.temperature = (self.model_dim * torch.exp(torch.clamp(nn.Parameter(
-                torch.Tensor([1]), requires_grad=True), min=0.005, max=5))).cuda()
+            self.temperature = nn.Parameter((self.model_dim * torch.exp(torch.clamp(
+                torch.Tensor([1]), min=0.005, max=5))), requires_grad = True).cuda()
         else:
             self.temperature = temperature
         self.append_prefix = self.prefix_tuning and not self.is_decoder and not self.attn_prefix_tuning
@@ -931,7 +928,7 @@ class T5Stack(T5PreTrainedModel):
                 self.attn_Wa = nn.Linear(
                     self.model_dim, self.model_dim, bias=False)
                 self.layer_norm = nn.LayerNorm(self.model_dim)
-            if self.attn_method == "sub":
+            if self.attn_method == "sub" or self.attn_method == "emd":
                 self.attn_W_down = nn.Linear(self.model_dim, 100, bias=False)
                 self.attn_W_up = nn.Linear(100, self.model_dim, bias=False)
                 self.attn_non_linear = nn.SiLU()
@@ -1064,7 +1061,6 @@ class T5Stack(T5PreTrainedModel):
         if inputs_embeds is None:
             assert self.embed_tokens is not None, "You have to initialize the model with valid token embeddings"
             inputs_embeds = self.embed_tokens(input_ids)
-            ######################################
             if self.append_prefix and self.append_attn_prefix is False:
                 inputs_embeds = torch.cat([self.prefix_emb.unsqueeze(0).repeat(
                     inputs_embeds.shape[0], 1, 1), inputs_embeds], dim=1)  # bsz, seqlen, dim
@@ -1090,7 +1086,6 @@ class T5Stack(T5PreTrainedModel):
                     mul_prefix_emb_added = self.mul_prefix_emb.repeat(
                         inputs_embeds.shape[0], 1, 1, 1)
                     avg_mul_prefix_emb, _ = torch.max(mul_prefix_emb_added, 2)
-
                 if self.append_attn_prefix:
                     # 1. dot product
                     if self.attn_method == "dot":
@@ -1099,13 +1094,12 @@ class T5Stack(T5PreTrainedModel):
                             avg_inputs_embeds).squeeze(-1)
 
                     elif self.attn_method == "linear":
-                        # 2. linear
                         x = self.attn_Wa(avg_inputs_embeds)
                         x = self.layer_norm(x)
                         x = x.unsqueeze(-1)
                         attn_scores = avg_mul_prefix_emb.bmm(
                             x).squeeze(-1) / self.temperature
-
+                    
                     elif self.attn_method == "sub":
                         x = self.attn_W_down(avg_inputs_embeds)
                         x = self.attn_non_linear(x)
@@ -1114,7 +1108,7 @@ class T5Stack(T5PreTrainedModel):
                         x = x.unsqueeze(-1)
                         attn_scores = avg_mul_prefix_emb.bmm(
                             x).squeeze(-1) / self.temperature
-
+                      
                     # implement token level model
                     elif self.attn_method == "token":
                         x = self.attn_W_down(avg_inputs_embeds)
@@ -1124,7 +1118,24 @@ class T5Stack(T5PreTrainedModel):
                         x = x.unsqueeze(-1)
                         attn_scores = torch.einsum(
                             "bpld,bdk->bplk", mul_prefix_emb_added, x) / self.temperature
-
+                        
+                    elif self.attn_method == "emd":
+                        x = self.attn_W_down(inputs_embeds)
+                        x = self.attn_non_linear(x)
+                        x = self.attn_W_up(x)
+                        x = self.layer_norm(x)
+                    
+                        prefix_emb_added = torch.cat((self.mul_prefix_emb, self.prefix_emb.unsqueeze(0)), dim=0)
+                        a, b = np.ones((256,)) / 256, np.ones((100,)) / 100
+                        a_tensor = torch.from_numpy(a).to('cuda')
+                        b_tensor = torch.from_numpy(b).to('cuda')
+                        attn_scores = torch.stack([torch.stack([torch.sum((ot.emd(a_tensor, b_tensor, ot.dist(x_i, prefix_emb_added[j]), check_marginals=False)) * ot.dist(x_i, prefix_emb_added[j])) \
+                                        for j in range(prefix_emb_added.shape[0])], dim=0) \
+                                        for i, x_i in enumerate(torch.unbind(x, dim=0), 0)], dim=0)
+                        attn_scores = attn_scores/ self.temperature
+                        #Only use this when learned temperature is true
+                        #print('attn_scores_device: ', attn_scores.get_device())
+                        #print('temperature_device: ', self.temperature.get_device())                
                     elif self.attn_method == "constant":
                         # FIXME: more efficient implementation
                         attn_scores = (torch.ones(mul_prefix_emb_added.size(
@@ -1132,10 +1143,11 @@ class T5Stack(T5PreTrainedModel):
                     else:
                         raise NotImplementedError
 
-                    if self.attn_method == "sub" or self.attn_method == "constant":
-                        normalized_attn_scores = F.softmax(attn_scores, -1)
+                    if self.attn_method == "sub" or self.attn_method == "constant" or self.attn_method == "emd":
+                        normalized_attn_scores = F.softmax(attn_scores.float(), -1)
                         soft_prompts = torch.einsum(
                             'bp, bpld -> bld', normalized_attn_scores, mul_prefix_emb_added)
+                        print(normalized_attn_scores)
                     elif self.attn_method == "token":
                         normalized_attn_scores = F.softmax(attn_scores, 1)
                         soft_prompts = torch.einsum(
@@ -1735,7 +1747,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
         self.encoder = T5Stack(encoder_config, self.shared, adapter_config=adapter_config, prefix_emb=self.prefix_shared, attn_prefix_tuning=self.attn_prefix_tuning, mul_prefix_emb=self.mul_prefix_emb,
-                               model_dim=config.d_model, attn_method=self.attn_method, shared_attn=self.shared_attn, ignore_target=self.ignore_target, temperature=self.temperature, learned_temperature=self.learned_temperature)
+                               model_dim=config.d_model, attn_method=self.attn_method, shared_attn=self.shared_attn, ignore_target=self.ignore_target, temperature=self.temperature, learned_temperature= self.learned_temperature)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
@@ -1798,78 +1810,11 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
     def update_prefix_weights_multi(self, prefix_embedding, num_target):
         self.prefix_shared.data = torch.stack(
             [prefix_embedding.detach().clone() for _ in range(num_target)])
-    
-    def compute_SWGG(x_s, x_t, s = 0.01, epsilon = 1e-3, backend = None):
-        theta = np.random.random(x_s.shape[1])
-        n = x_s.shape[0]
-        if backend is not None:
-            nx = backend
-        else:
-            nx = NumpyBackend()
-        def project_Q(input, mapping):
-            mapping_res = np.empty((input.shape[0], input.shape[1]))
-            for i in range(input.shape[0]):
-                mapping_res  = np.append(mapping_res, [mapping * nx.dot(input[i][:], mapping)], axis = 0)
-            return mapping_res
-        def project_P(input, mapping):
-            mapping_res = []
-            for i in range(input.shape[0]):
-                mapping_res.append(nx.dot(input[i][:], mapping))
-            return list_to_array(mapping_res)
-        P = project_P(x_s, theta)
-        Q =[project_Q(x_t, theta)[i][i] for i in range(x_t.shape[0])]
-        sigma = nx.argsort(P)
-        tau = nx.argsort(Q)
-        X_s = []
-        Y_s = []
-        for i in range(x_s.shape[0]):
-            X_s.append([x_s[sigma[i]][i] for i in range(s)])
-        for i in range(x_t.shape[0]):
-            Y_s.append([x_t[sigma[i]][i] for i in range(s)])
-
-        X_s, Y_s = list_to_array(X_s, Y_s)
-        dot_product_x_s = [0] * X_s.shape[0]
-        dot_product_x_t = [0] * Y_s.shape[0]
-
-        for i in range(X_s.shape[0]):
-            dot_product_x_s[i] = nx.dot(X_s[i][:], theta)
-        for i in range(Y_s.shape[0]):
-            dot_product_x_t[i] = nx.dot(Y_s[i][:], theta)
-
-        noise_X_s = nx.random.normal(0, epsilon / 2, len(dot_product_x_s))
-        noise_Y_s = nx.random.normal(0, epsilon / 2, len(dot_product_x_t))
-
-        dot_product_x_s, dot_product_x_t = list_to_array(dot_product_x_s, dot_product_x_t)
-        dot_product_x_s = nx.add(dot_product_x_s, noise_X_s)
-        dot_product_x_t = nx.add(dot_product_x_t, noise_Y_s)
-
-        sigma_s = nx.argsort(dot_product_x_s)
-        tau_s = nx.argsort(dot_product_x_t)
-        a = (2 / n) * (nx.sum(nx.linalg(nx.subtract(x_s, project_Q(x_s, theta)), axis = 1)) - nx.sum(nx.linalg(nx.subtract(x_t, project_Q(x_t, theta)), axis = 1)))
-        sum_norm_project_P = 0
-        for i in range(x_s.shape[0]):
-            sum_norm_project_P += abs(project_P(x_s[sigma[i]][:]) + project_P(x_s[tau[i][:]]))
-        b = (2/n) * sum_norm_project_P
-        sum_norm = 0
-        for i in range(x_s.shape[0]):
-            first_term = 0.5 * (project_Q(x_s[sigma[i]]) + project_Q(x_t[tau[i]]))
-            start = (i - 1) * s + 1
-            stop = i * s
-            cummulative_sum_array = nx.zeros(x_s.shape[1])
-            for k in range(start, stop + 1, 1):
-                cummulative_sum_array += (X_s[sigma_s[k]] + Y_s[tau_s[k]])
-            cummulative_sum_array = (1/(2 * s)) * cummulative_sum_array
-            final_experession_under_norm = first_term - cummulative_sum_array
-            sum_norm += nx.linalg.norm(final_experession_under_norm)
-        c = (4 / n) * sum_norm
-
-        res = a + b - c
-        return res
 
     def update_prefix_weights(self, prefix_embeddings, target_embedding=None):
 
         def prefix_emb_similarity(emb_a, emb_b):
-            return self.compute_SWGG(emb_a.cuda(), emb_b.cuda())
+            return torch.sum(F.cosine_similarity(emb_a.cuda(), emb_b.cuda()))
 
         if len(prefix_embeddings) == 1:
             self.prefix_shared.data = prefix_embeddings[0]
