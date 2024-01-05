@@ -25,7 +25,7 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.utils.checkpoint import checkpoint
 import numpy as np
-
+from models.t5.swgg import get_SWGG_smooth, quantile_SWGG_CP
 from transformers.activations import ACT2FN
 from transformers.file_utils import (
     DUMMY_INPUTS,
@@ -50,6 +50,7 @@ from adapters import AdapterController
 from typing import Dict, Any
 
 import ot
+from ot.sliced import sliced_wasserstein_distance
 
 logger = logging.get_logger(__name__)
 
@@ -928,7 +929,7 @@ class T5Stack(T5PreTrainedModel):
                 self.attn_Wa = nn.Linear(
                     self.model_dim, self.model_dim, bias=False)
                 self.layer_norm = nn.LayerNorm(self.model_dim)
-            if self.attn_method == "sub" or self.attn_method == "emd":
+            if self.attn_method == "sub" or self.attn_method == "emd" or self.attn_method == "swgg" or self.attn_method == "sw":
                 self.attn_W_down = nn.Linear(self.model_dim, 100, bias=False)
                 self.attn_W_up = nn.Linear(100, self.model_dim, bias=False)
                 self.attn_non_linear = nn.SiLU()
@@ -1118,20 +1119,53 @@ class T5Stack(T5PreTrainedModel):
                         x = x.unsqueeze(-1)
                         attn_scores = torch.einsum(
                             "bpld,bdk->bplk", mul_prefix_emb_added, x) / self.temperature
-                        
-                    elif self.attn_method == "emd":
+
+                    elif self.attn_method == "sw":
+                        print("==============================================")
+                        print("sw")
+                        print("==============================================")
+                        x = self.attn_W_down(inputs_embeds)
+                        x = self.attn_non_linear(x)
+                        x = self.attn_W_up(x)
+                        x = self.layer_norm(x)
+                        prefix_emb_added = torch.cat((self.mul_prefix_emb, self.prefix_emb.unsqueeze(0)), dim=0)
+                        attn_scores = torch.stack([torch.stack([sliced_wasserstein_distance(x_i, prefix_emb_added[j], seed=0, n_projections=1000) \
+                                        for j in range(prefix_emb_added.shape[0])], dim=0) \
+                           for i, x_i in enumerate(torch.unbind(x, dim=0), 0)], dim=0)
+
+                    elif self.attn_method == "swgg":
                         x = self.attn_W_down(inputs_embeds)
                         x = self.attn_non_linear(x)
                         x = self.attn_W_up(x)
                         x = self.layer_norm(x)
                     
                         prefix_emb_added = torch.cat((self.mul_prefix_emb, self.prefix_emb.unsqueeze(0)), dim=0)
-                        a, b = np.ones((256,)) / 256, np.ones((100,)) / 100
-                        a_tensor = torch.from_numpy(a).to('cuda')
-                        b_tensor = torch.from_numpy(b).to('cuda')
-                        attn_scores = torch.stack([torch.stack([torch.sum((ot.emd(a_tensor, b_tensor, ot.dist(x_i, prefix_emb_added[j]), check_marginals=False)) * ot.dist(x_i, prefix_emb_added[j])) \
+
+                        attn_scores = torch.stack([torch.stack([torch.sum((quantile_SWGG_CP(x_i, prefix_emb_added[j]))) \
                                         for j in range(prefix_emb_added.shape[0])], dim=0) \
                                         for i, x_i in enumerate(torch.unbind(x, dim=0), 0)], dim=0)
+                        
+                        attn_scores = attn_scores.to(inputs_embeds.device)/ self.temperature.to(inputs_embeds.device)
+                        
+                    elif self.attn_method == "emd":
+                        x = self.attn_W_down(inputs_embeds)
+                        x = self.attn_non_linear(x)
+                        x = self.attn_W_up(x)
+                        x = self.layer_norm(x)
+                        ns = 256
+                        nt = 100
+                    
+                        prefix_emb_added = torch.cat((self.mul_prefix_emb, self.prefix_emb.unsqueeze(0)), dim=0)
+                        a=(torch.ones((ns,),dtype=float)/ns).to(inputs_embeds.device)
+
+                        b=(torch.randint(1, 5, (nt,),dtype=float)).to(inputs_embeds.device)
+                        #a, b = np.ones((256,)) / 256, np.ones((100,)) / 100
+                        #a_tensor = torch.from_numpy(a).to('cuda')
+                        #b_tensor = torch.from_numpy(b).to('cuda')
+                        attn_scores = torch.stack([torch.stack([torch.sum(ot.emd(a,b,(ot.dist(x_i, prefix_emb_added[j]) / ot.dist(x_i, prefix_emb_added[j]).max()), check_marginals=False) * ot.dist(x_i, prefix_emb_added[j])) for j in range(prefix_emb_added.shape[0])], dim=0) for i, x_i in enumerate(torch.unbind(x, dim=0), 0)], dim=0)
+
+
+
                         attn_scores = attn_scores/ self.temperature
                         #Only use this when learned temperature is true
                         #print('attn_scores_device: ', attn_scores.get_device())
@@ -1143,7 +1177,7 @@ class T5Stack(T5PreTrainedModel):
                     else:
                         raise NotImplementedError
 
-                    if self.attn_method == "sub" or self.attn_method == "constant" or self.attn_method == "emd":
+                    if self.attn_method == "sub" or self.attn_method == "constant" or self.attn_method == "emd" or self.attn_method == "swgg" or self.attn_method == "sw":
                         normalized_attn_scores = F.softmax(attn_scores.float(), -1)
                         soft_prompts = torch.einsum(
                             'bp, bpld -> bld', normalized_attn_scores, mul_prefix_emb_added)
